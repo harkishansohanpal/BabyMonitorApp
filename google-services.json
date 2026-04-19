@@ -1,0 +1,46 @@
+{
+  "project_info": {
+    "project_number": "405441456466",
+    "project_id": "baby-monitor-a2e04",
+    "storage_bucket": "baby-monitor-a2e04.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:405441456466:android:02efa373771b6067ccb28b",
+        "android_client_info": {
+          "package_name": "com.harkishansohanpal.BabyMonitorApp"
+        }
+      },
+      "oauth_client": [
+        {
+          "client_id": "405441456466-fgraes60p8d4lruv1pt5iglvn0a8m1r8.apps.googleusercontent.com",
+          "client_type": 3
+        }
+      ],
+      "api_key": [
+        {
+          "current_key": "AIzaSyD1gt1d8iSLZxula5D3rhpBQxOw2oHR6yU"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": [
+            {
+              "client_id": "405441456466-fgraes60p8d4lruv1pt5iglvn0a8m1r8.apps.googleusercontent.com",
+              "client_type": 3
+            },
+            {
+              "client_id": "405441456466-2us3kt0d19o70mj1cggsg3dd2d0qeep9.apps.googleusercontent.com",
+              "client_type": 2,
+              "ios_info": {
+                "bundle_id": "com.harkishansohanpal.BabyMonitorApp"
+              }
+            }
+          ]
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

@@ -1,0 +1,44 @@
+{
+  "cli": {
+    "version": ">= 12.0.0",
+    "appVersionSource": "remote"
+  },
+  "build": {
+    "development": {
+      "developmentClient": true,
+      "distribution": "internal",
+      "ios": {
+        "simulator": false
+      },
+      "env": {
+        "EXPO_PUBLIC_ENV": "development"
+      }
+    },
+    "preview": {
+      "distribution": "internal",
+      "ios": {
+        "simulator": false
+      },
+      "env": {
+        "EXPO_PUBLIC_ENV": "production",
+        "EXPO_PUBLIC_API_BASE_URL": "https://baby-monitor-server-flp6.onrender.com",
+        "EXPO_PUBLIC_SIGNALING_URL": "wss://baby-monitor-server-flp6.onrender.com"
+      }
+    },
+    "production": {
+      "autoIncrement": true,
+      "env": {
+        "EXPO_PUBLIC_ENV": "production",
+        "EXPO_PUBLIC_API_BASE_URL": "https://baby-monitor-server-flp6.onrender.com",
+        "EXPO_PUBLIC_SIGNALING_URL": "wss://baby-monitor-server-flp6.onrender.com"
+      }
+    }
+  },
+  "submit": {
+    "production": {
+      "ios": {
+        "appleId": "harkishansohanpal@gmail.com"
+      }
+    }
+  }
+}

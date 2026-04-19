@@ -1,0 +1,59 @@
+{
+  "expo": {
+    "name": "BabyMonitorApp",
+    "slug": "BabyMonitorApp",
+    "scheme": "babymonitor",
+    "version": "1.0.0",
+    "orientation": "default",
+    "icon": "./assets/icon.png",
+    "userInterfaceStyle": "light",
+    "newArchEnabled": true,
+    "splash": {
+      "image": "./assets/splash-icon.png",
+      "resizeMode": "contain",
+      "backgroundColor": "#ffffff"
+    },
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "com.harkishansohanpal.BabyMonitorApp",
+      "infoPlist": {
+        "NSAppTransportSecurity": {
+          "NSAllowsArbitraryLoads": true
+        },
+        "NSCameraUsageDescription": "Baby Monitor needs camera access to stream video.",
+        "NSMicrophoneUsageDescription": "Baby Monitor needs microphone access for audio monitoring.",
+        "ITSAppUsesNonExemptEncryption": false,
+        "UIBackgroundModes": ["audio"]
+      }
+    },
+    "android": {
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/adaptive-icon.png",
+        "backgroundColor": "#ffffff"
+      },
+      "edgeToEdgeEnabled": true,
+      "package": "com.harkishansohanpal.BabyMonitorApp",
+      "googleServicesFile": "./google-services.json"
+    },
+    "web": {
+      "favicon": "./assets/favicon.png"
+    },
+    "plugins": [
+      "expo-dev-client",
+      "expo-web-browser",
+      "expo-secure-store",
+      [
+        "@react-native-google-signin/google-signin",
+        {
+          "iosUrlScheme": "com.googleusercontent.apps.405441456466-2us3kt0d19o70mj1cggsg3dd2d0qeep9"
+        }
+      ]
+    ],
+    "extra": {
+      "eas": {
+        "projectId": "79674cc5-11c3-4841-a4a5-d9cd075ecbe7"
+      }
+    },
+    "owner": "harkishansohanpal"
+  }
+}
