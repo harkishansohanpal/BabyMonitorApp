@@ -32,7 +32,6 @@
  * @module services/firebase
  */
 
-import { Platform } from 'react-native';
 import { initializeApp, getApps, getApp } from 'firebase/app';
 import {
   initializeAuth,
@@ -48,8 +47,23 @@ import {
   deleteUser as firebaseDeleteUser,
 } from 'firebase/auth';
 import AsyncStorage from '@react-native-async-storage/async-storage';
-import { GoogleSignin, statusCodes as GoogleStatusCodes } from '@react-native-google-signin/google-signin';
+import { NativeModules, Platform } from 'react-native';
 import * as WebBrowser from 'expo-web-browser';
+
+// Safely import GoogleSignin — it requires a native build and won't exist in Expo Go on iOS.
+let GoogleSignin = null;
+let GoogleStatusCodes = {};
+const isGoogleSignInAvailable = !!NativeModules.RNGoogleSignin;
+
+if (isGoogleSignInAvailable) {
+  try {
+    const gsModule = require('@react-native-google-signin/google-signin');
+    GoogleSignin = gsModule.GoogleSignin;
+    GoogleStatusCodes = gsModule.statusCodes;
+  } catch (_e) {
+    // Native module not available (Expo Go on iOS)
+  }
+}
 
 import logger from '../utils/logger';
 
@@ -172,15 +186,17 @@ export async function signUpWithEmail(email, password, displayName = '') {
 // Google Sign-In (native — @react-native-google-signin/google-signin)
 // ---------------------------------------------------------------------------
 
-// Configure once at module load time.
-GoogleSignin.configure({
-  webClientId:     process.env.EXPO_PUBLIC_GOOGLE_WEB_CLIENT_ID,
-  iosClientId:     process.env.EXPO_PUBLIC_GOOGLE_IOS_CLIENT_ID,
-  offlineAccess:   false,
-  scopes:          ['profile', 'email'],
-});
+// Configure once at module load time (only when native module is available).
+if (GoogleSignin) {
+  GoogleSignin.configure({
+    webClientId:   process.env.EXPO_PUBLIC_GOOGLE_WEB_CLIENT_ID,
+    iosClientId:   process.env.EXPO_PUBLIC_GOOGLE_IOS_CLIENT_ID,
+    offlineAccess: false,
+    scopes:        ['profile', 'email'],
+  });
+}
 
-export { GoogleStatusCodes };
+export { GoogleStatusCodes, isGoogleSignInAvailable };
 
 /**
  * Native Google Sign-In using @react-native-google-signin/google-signin.
@@ -191,6 +207,12 @@ export { GoogleStatusCodes };
  * @throws If the user cancels (code === GoogleStatusCodes.SIGN_IN_CANCELLED) or on error.
  */
 export async function signInWithGoogleNative() {
+  if (!GoogleSignin || !isGoogleSignInAvailable) {
+    throw Object.assign(
+      new Error('Google Sign-In is not available in Expo Go on iOS. Please use email/password sign-in, or install the full app build.'),
+      { code: 'NOT_AVAILABLE' },
+    );
+  }
   logger.info('signInWithGoogleNative: starting');
   await GoogleSignin.hasPlayServices({ showPlayServicesUpdateDialog: true });
   const response = await GoogleSignin.signIn();

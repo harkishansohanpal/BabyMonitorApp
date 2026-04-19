@@ -278,6 +278,14 @@ export function AuthProvider({ children }) {
         if (mountedRef.current) setLoading(false);
         return;
       }
+      // Native module not available (Expo Go on iOS — no paid Apple dev account yet)
+      if (err?.code === 'NOT_AVAILABLE') {
+        if (mountedRef.current) {
+          setError('Google Sign-In requires the full app install. Please use email & password instead.');
+          setLoading(false);
+        }
+        return;
+      }
       logger.error('AuthContext.loginWithGoogle: failed', err);
       if (mountedRef.current) {
         setError(humaniseFirebaseError(err) || 'Google sign-in failed. Please try again.');
