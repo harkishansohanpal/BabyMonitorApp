@@ -212,16 +212,14 @@ export default function VideoFeedScreen() {
 
   // Config injected into the WebView page before its scripts run.
   // window.__RN_CFG__ is read by the monitor/viewer HTML served from the server.
-  // Pass config in the URL hash — fragments are never sent to the server
-  // (token stays private) but are immediately available via window.location.hash,
-  // bypassing injectedJavaScript timing issues on Android WebView.
-  const configHash = token
-    ? '#' + encodeURIComponent(JSON.stringify({
-        token,
-        roomId,
-        signalingUrl: SIGNALING_HTTP,
-        iceServers,
-      }))
+  // Config is delivered to the WebView page via three mechanisms (most → least reliable):
+  // 1. onLoad + injectJavaScript → calls window.__rnReady(cfg) after page scripts run
+  // 2. injectedJavaScriptBeforeContentLoaded → sets window.__RN_CFG__ early (good on iOS)
+  // 3. URL hash fallback → for Android where injection timing can vary
+  const configObj = token ? { token, roomId, signalingUrl: SIGNALING_HTTP, iceServers } : null;
+  const configJson = configObj ? JSON.stringify(configObj) : null;
+  const configHash = configJson
+    ? '#' + encodeURIComponent(configJson)
     : '';
 
   // ── Role picker ──────────────────────────────────────────────────────────────
@@ -341,8 +339,8 @@ export default function VideoFeedScreen() {
   // ── Active session ───────────────────────────────────────────────────────────
   // iOS: skip hash (injectedJavaScriptBeforeContentLoaded is reliable on iOS WKWebView)
   // Android: use hash (injectedJavaScript timing is unreliable on Android WebView)
-  const webViewUri = (mode === 'monitor' ? MONITOR_URL : VIEWER_URL) +
-    (Platform.OS === 'ios' ? '' : configHash);
+  // Always include hash as last-resort fallback; primary delivery is via onLoad injection
+  const webViewUri = (mode === 'monitor' ? MONITOR_URL : VIEWER_URL) + configHash;
   const showRetryOverlay = mode === 'viewer' && viewerStatus !== 'live';
 
   // Android monitor uses native WebRTC (react-native-webrtc) to bypass WebView
@@ -369,7 +367,15 @@ export default function VideoFeedScreen() {
           ref={webViewRef}
           source={{ uri: webViewUri }}
           style={styles.webView}
-          injectedJavaScriptBeforeContentLoaded={token ? `window.__RN_CFG__ = ${JSON.stringify({ token, roomId, signalingUrl: SIGNALING_HTTP, iceServers })};true;` : undefined}
+          injectedJavaScriptBeforeContentLoaded={configJson ? `window.__RN_CFG__=${configJson};true;` : undefined}
+          onLoad={() => {
+            // Primary config delivery — runs after page scripts, guaranteed on all platforms
+            if (webViewRef.current && configJson) {
+              webViewRef.current.injectJavaScript(
+                `if(window.__rnReady&&!window.__rnInitialized){window.__rnInitialized=true;window.__rnReady(${configJson});}true;`
+              );
+            }
+          }}
           mediaPlaybackRequiresUserAction={false}
           allowsInlineMediaPlayback
           javaScriptEnabled
