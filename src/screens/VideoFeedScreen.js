@@ -339,7 +339,10 @@ export default function VideoFeedScreen() {
   }
 
   // ── Active session ───────────────────────────────────────────────────────────
-  const webViewUri = (mode === 'monitor' ? MONITOR_URL : VIEWER_URL) + configHash;
+  // iOS: skip hash (injectedJavaScriptBeforeContentLoaded is reliable on iOS WKWebView)
+  // Android: use hash (injectedJavaScript timing is unreliable on Android WebView)
+  const webViewUri = (mode === 'monitor' ? MONITOR_URL : VIEWER_URL) +
+    (Platform.OS === 'ios' ? '' : configHash);
   const showRetryOverlay = mode === 'viewer' && viewerStatus !== 'live';
 
   // Android monitor uses native WebRTC (react-native-webrtc) to bypass WebView
