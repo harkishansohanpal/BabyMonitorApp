@@ -5,19 +5,29 @@
  *   monitor — Camera phone placed in baby's room. Streams video + audio.
  *   viewer  — Parent phone watching the live feed.
  *
- * Both sides connect to the Socket.io signaling server with a Firebase
- * auth token and join a shared room ID to establish a WebRTC peer connection.
+ * The WebView pages are served from the HTTPS server so Android WebView
+ * treats them as a secure context and allows getUserMedia() camera access.
+ * Credentials (token, roomId, signalingUrl, iceServers) are injected into
+ * window.__RN_CFG__ before the page scripts run.
  */
 
 import React, { useState, useRef, useEffect } from 'react';
 import {
   View, Text, StyleSheet, TouchableOpacity,
   TextInput, Alert, ActivityIndicator, Platform, Modal,
+  StatusBar, Dimensions,
 } from 'react-native';
 import { WebView } from 'react-native-webview';
 import { Ionicons } from '@expo/vector-icons';
 import { useKeepAwake } from 'expo-keep-awake';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
+import { useCameraPermissions, useMicrophonePermissions } from 'expo-camera';
 import { auth } from '../services/firebase';
+import NativeMonitorView from './NativeMonitorView';
+
+// Use native WebRTC monitor on Android (bypasses WebView camera restrictions).
+// iOS WebView handles getUserMedia fine so WebView monitor is kept there.
+const USE_NATIVE_MONITOR = Platform.OS === 'android';
 
 const SESSION_LIMIT_MS = 60 * 60 * 1000; // 60 minutes
 
@@ -25,342 +35,68 @@ const SESSION_LIMIT_MS = 60 * 60 * 1000; // 60 minutes
 const SIGNALING_WSS  = process.env.EXPO_PUBLIC_SIGNALING_URL  || 'wss://baby-monitor-server-flp6.onrender.com';
 const SIGNALING_HTTP = SIGNALING_WSS.replace('wss://', 'https://').replace('ws://', 'http://');
 
-// ── HTML generators ───────────────────────────────────────────────────────────
+const MONITOR_URL = `${SIGNALING_HTTP}/app/monitor`;
+const VIEWER_URL  = `${SIGNALING_HTTP}/app/viewer`;
+
+// STUN-only fallback used when TURN credentials can't be fetched
+const STUN_ONLY = [
+  { urls: 'stun:stun.l.google.com:19302' },
+  { urls: 'stun:stun1.l.google.com:19302' },
+];
 
 /**
- * HTML for the monitor (camera) side.
- * Captures local camera/mic → streams to signaling server via WebRTC.
+ * Fetches short-lived Cloudflare TURN credentials from the backend.
+ * Falls back to STUN-only servers on any error so the app still works.
  */
-function buildMonitorHtml(token, roomId) {
-  return `<!DOCTYPE html>
-<html>
-<head>
-  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
-  <style>
-    * { margin:0; padding:0; box-sizing:border-box; }
-    body { background:#000; display:flex; flex-direction:column; align-items:center;
-           justify-content:center; height:100vh; font-family:-apple-system,sans-serif; }
-    video { width:100%; max-height:72vh; background:#111; border-radius:8px; transform:scaleX(-1); }
-    #status { color:#fff; margin:10px; font-size:14px; text-align:center; }
-    #room   { color:#888; font-size:11px; margin-top:2px; }
-    #error  { color:#ff6b6b; margin:6px; font-size:12px; text-align:center; }
-  </style>
-</head>
-<body>
-  <video id="localVideo" autoplay playsinline muted></video>
-  <div id="status">Starting camera…</div>
-  <div id="room">Room: ${roomId}</div>
-  <div id="error"></div>
-
-<script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
-<script>
-(function () {
-  var STATUS = document.getElementById('status');
-  var ERROR  = document.getElementById('error');
-  var video  = document.getElementById('localVideo');
-
-  var ICE = { iceServers: [
-    { urls: 'stun:stun.l.google.com:19302' },
-    { urls: 'stun:stun1.l.google.com:19302' },
-  ]};
-
-  var pc = null;
-  var socket;
-  var localStream;
-
-  function rn(msg) {
-    window.ReactNativeWebView && window.ReactNativeWebView.postMessage(msg);
-  }
-
-  // Create a fresh PC and re-attach local tracks.
-  // Called each time a new viewer connects so the session is clean.
-  function createPC() {
-    if (pc) try { pc.close(); } catch(_) {}
-    pc = new RTCPeerConnection(ICE);
-    if (localStream) {
-      localStream.getTracks().forEach(function(t) { pc.addTrack(t, localStream); });
-    }
-    pc.onicecandidate = function(e) {
-      if (e.candidate && socket && socket.connected) {
-        socket.emit('ice-candidate', { candidate: e.candidate });
-      }
-    };
-    pc.oniceconnectionstatechange = function() {
-      if (pc.iceConnectionState === 'failed') {
-        pc.restartIce && pc.restartIce();
-      }
-    };
-    return pc;
-  }
-
-  async function startCamera() {
-    try {
-      localStream = await navigator.mediaDevices.getUserMedia({
-        video: { facingMode: 'environment', width: { ideal: 1280 }, height: { ideal: 720 } },
-        audio: true,
-      });
-      video.srcObject = localStream;
-      createPC();
-      STATUS.textContent = 'Camera ready — connecting…';
-      connectSocket();
-    } catch (err) {
-      ERROR.textContent = 'Camera error: ' + err.message;
-      STATUS.textContent = 'Could not access camera';
-      rn('error');
-    }
-  }
-
-  function connectSocket() {
-    socket = io('${SIGNALING_HTTP}', {
-      auth: { token: '${token}' },
-      transports: ['websocket'],
-      reconnection: true,
+async function fetchIceServers(token) {
+  try {
+    const res = await fetch(`${SIGNALING_HTTP}/api/turn`, {
+      headers: { Authorization: `Bearer ${token}` },
     });
-
-    socket.on('connect', function () {
-      STATUS.textContent = 'Connected — waiting for viewer…';
-      socket.emit('join', { roomId: '${roomId}', role: 'camera' });
-      rn('socket-connected');
-    });
-
-    // Viewer joined — ask the viewer to create the offer.
-    // This means the viewer's own device generates the SDP, avoiding
-    // any iOS → Android (or Android → iOS) SDP incompatibility.
-    socket.on('peer-joined', function (data) {
-      if (data.role === 'viewer') {
-        STATUS.textContent = 'Viewer joined — setting up stream…';
-        createPC();                        // fresh PC with local tracks
-        socket.emit('request-offer');      // viewer will send us an offer
-      }
-    });
-
-    // Viewer sent us their offer — respond with an answer.
-    socket.on('offer', async function (data) {
-      try {
-        await pc.setRemoteDescription(data.sdp);
-        var answer = await pc.createAnswer();
-        await pc.setLocalDescription(answer);
-        socket.emit('answer', { sdp: { type: answer.type, sdp: answer.sdp } });
-        STATUS.textContent = '✅ Streaming live';
-        rn('streaming');
-      } catch (err) {
-        ERROR.textContent = 'Stream error: ' + err.message;
-      }
-    });
-
-    socket.on('ice-candidate', async function (data) {
-      if (data.candidate) {
-        try { await pc.addIceCandidate(data.candidate); } catch (_) {}
-      }
-    });
-
-    socket.on('peer-disconnected', function () {
-      STATUS.textContent = 'Viewer left — waiting…';
-      rn('viewer-left');
-    });
-
-    socket.on('connect_error', function (err) {
-      ERROR.textContent = 'Server error: ' + err.message;
-    });
+    if (!res.ok) throw new Error(`TURN ${res.status}`);
+    const data = await res.json();
+    const servers = Array.isArray(data) ? data : [data];
+    return [{ urls: 'stun:stun.l.google.com:19302' }, ...servers];
+  } catch (err) {
+    console.warn('TURN fetch failed, using STUN only:', err.message);
+    return STUN_ONLY;
   }
-
-  startCamera();
-})();
-</script>
-</body>
-</html>`;
-}
-
-/**
- * HTML for the viewer (parent) side.
- * Receives the remote video/audio stream from the monitor phone.
- */
-function buildViewerHtml(token, roomId) {
-  return `<!DOCTYPE html>
-<html>
-<head>
-  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
-  <style>
-    * { margin:0; padding:0; box-sizing:border-box; }
-    body { background:#000; display:flex; flex-direction:column; align-items:center;
-           justify-content:center; height:100vh; font-family:-apple-system,sans-serif; }
-    video { width:100%; max-height:72vh; background:#111; border-radius:8px; }
-    #status { color:#fff; margin:10px; font-size:14px; text-align:center; }
-    #room   { color:#888; font-size:11px; margin-top:2px; }
-    #error  { color:#ff6b6b; margin:6px; font-size:12px; text-align:center; }
-  </style>
-</head>
-<body>
-  <video id="remoteVideo" autoplay playsinline></video>
-  <div id="status">Connecting to room…</div>
-  <div id="room">Room: ${roomId}</div>
-  <div id="error"></div>
-
-<script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
-<script>
-(function () {
-  var STATUS = document.getElementById('status');
-  var ERROR  = document.getElementById('error');
-  var video  = document.getElementById('remoteVideo');
-
-  var ICE_SERVERS = {
-    iceServers: [
-      { urls: 'stun:stun.l.google.com:19302' },
-      { urls: 'stun:stun1.l.google.com:19302' },
-    ]
-  };
-
-  var pc = null;
-
-  function rn(msg) {
-    window.ReactNativeWebView && window.ReactNativeWebView.postMessage(msg);
-  }
-
-  // Strips SDP attributes that cause cross-platform failures between
-  // iOS WebKit and Android WebView (e.g. extmap-allow-mixed).
-  function sanitizeSDP(sdpObj) {
-    if (!sdpObj || !sdpObj.sdp) return sdpObj;
-    var clean = sdpObj.sdp
-      .split(/\r?\n/)
-      .filter(function(line) { return line !== 'a=extmap-allow-mixed'; })
-      .join('\r\n');
-    return { type: sdpObj.type, sdp: clean };
-  }
-
-  // Create a fresh RTCPeerConnection and wire up all handlers.
-  // Called on first load and every time the camera reconnects.
-  function createPC() {
-    if (pc) {
-      try { pc.close(); } catch (_) {}
-    }
-    pc = new RTCPeerConnection(ICE_SERVERS);
-
-    pc.ontrack = function (e) {
-      if (e.streams && e.streams[0]) {
-        video.srcObject = e.streams[0];
-        STATUS.textContent = '✅ Live feed connected';
-        ERROR.textContent = '';
-        rn('connected');
-      }
-    };
-
-    pc.oniceconnectionstatechange = function () {
-      if (pc.iceConnectionState === 'disconnected' || pc.iceConnectionState === 'failed') {
-        STATUS.textContent = '⚠️ Connection lost';
-        rn('disconnected');
-      }
-    };
-
-    pc.onicecandidate = function (e) {
-      if (e.candidate && socket.connected) {
-        socket.emit('ice-candidate', { candidate: e.candidate });
-      }
-    };
-
-    return pc;
-  }
-
-  var socket = io('${SIGNALING_HTTP}', {
-    auth: { token: '${token}' },
-    transports: ['websocket'],
-    reconnection: true,
-  });
-
-  socket.on('connect', function () {
-    STATUS.textContent = 'Connected — joining room…';
-    socket.emit('join', { roomId: '${roomId}', role: 'viewer' });
-  });
-
-  socket.on('waiting-for-camera', function () {
-    STATUS.textContent = '⏳ Waiting for monitor to come online…';
-    rn('waiting');
-  });
-
-  socket.on('peer-joined', function (data) {
-    if (data.role === 'camera') {
-      STATUS.textContent = 'Monitor online — waiting for stream…';
-    }
-  });
-
-  // Monitor asks us to initiate WebRTC — we create the offer.
-  // This means Android always uses its OWN SDP format regardless of
-  // what platform the monitor is on, avoiding iOS ↔ Android SDP issues.
-  socket.on('request-offer', async function () {
-    STATUS.textContent = 'Setting up stream…';
-    try {
-      createPC();
-      // Add receive-only transceivers so the offer signals we want audio+video
-      pc.addTransceiver('video', { direction: 'recvonly' });
-      pc.addTransceiver('audio', { direction: 'recvonly' });
-      var offer = await pc.createOffer();
-      await pc.setLocalDescription(offer);
-      socket.emit('offer', { sdp: { type: offer.type, sdp: offer.sdp } });
-    } catch (err) {
-      ERROR.textContent = 'Setup error: ' + err.message;
-      rn('disconnected');
-    }
-  });
-
-  // Monitor answered our offer — set it as remote description.
-  socket.on('answer', async function (data) {
-    try {
-      await pc.setRemoteDescription(data.sdp);
-    } catch (err) {
-      ERROR.textContent = 'Connection error: ' + err.message;
-      rn('disconnected');
-    }
-  });
-
-  socket.on('ice-candidate', async function (data) {
-    if (data.candidate) {
-      try { await pc.addIceCandidate(data.candidate); } catch (_) {}
-    }
-  });
-
-  socket.on('peer-disconnected', function () {
-    STATUS.textContent = '📷 Monitor stopped — waiting for reconnect…';
-    video.srcObject = null;
-    rn('disconnected');
-  });
-
-  socket.on('connect_error', function (err) {
-    ERROR.textContent = 'Server error: ' + err.message;
-  });
-})();
-</script>
-</body>
-</html>`;
 }
 
 // ── Component ─────────────────────────────────────────────────────────────────
 
 export default function VideoFeedScreen() {
   useKeepAwake();
+  const insets = useSafeAreaInsets();
 
-  const [mode, setMode]           = useState(null);   // null | 'monitor' | 'viewer'
-  const [roomInput, setRoomInput] = useState('');
-  const [roomId, setRoomId]       = useState('');
-  const [token, setToken]         = useState(null);
-  const [isConnected, setIsConnected] = useState(false);
-  const [elapsed, setElapsed]         = useState(0);
-  const [step, setStep]               = useState('pick'); // 'pick' | 'viewer-code'
-  const [viewerStatus, setViewerStatus] = useState('connecting'); // 'connecting'|'waiting'|'live'|'lost'
-  const [webViewKey, setWebViewKey]   = useState(0); // bump to force WebView reload
+  // Camera & mic permissions — must be granted before WebView can call getUserMedia
+  const [cameraPermission, requestCameraPermission] = useCameraPermissions();
+  const [micPermission,    requestMicPermission]    = useMicrophonePermissions();
+
+  const [mode, setMode]             = useState(null);   // null | 'monitor' | 'viewer'
+  const [roomInput, setRoomInput]   = useState('');
+  const [roomId, setRoomId]         = useState('');
+  const [token, setToken]           = useState(null);
+  const [iceServers, setIceServers] = useState(STUN_ONLY);
+  const [isConnected, setIsConnected]   = useState(false);
+  const [elapsed, setElapsed]           = useState(0);
+  const [step, setStep]                 = useState('pick'); // 'pick' | 'viewer-code'
+  const [viewerStatus, setViewerStatus] = useState('connecting');
+  const [webViewKey, setWebViewKey]     = useState(0);
+
   const webViewRef   = useRef(null);
   const sessionTimer = useRef(null);
   const tickTimer    = useRef(null);
 
-  // Always force-refresh the Firebase token so it's never stale (tokens expire after 1 hour)
+  // Force-refresh Firebase token on mount
   useEffect(() => {
-    const currentUser = auth.currentUser;
-    if (currentUser) {
-      currentUser.getIdToken(/* forceRefresh= */ true)
-        .then(setToken)
-        .catch(err => console.warn('VideoFeedScreen: token error', err));
+    const u = auth.currentUser;
+    if (u) {
+      u.getIdToken(true).then(setToken).catch(e => console.warn('Token error', e));
     }
   }, []);
 
-  // Clear timers whenever mode is cleared
+  // Clear timers when session ends
   useEffect(() => {
     if (!mode) {
       clearTimeout(sessionTimer.current);
@@ -370,39 +106,51 @@ export default function VideoFeedScreen() {
   }, [mode]);
 
   function startSessionTimers() {
-    // Tick every second for the on-screen elapsed display
-    tickTimer.current = setInterval(() => {
-      setElapsed(s => s + 1);
-    }, 1000);
-
-    // Hard stop at 60 minutes
+    tickTimer.current = setInterval(() => setElapsed(s => s + 1), 1000);
     sessionTimer.current = setTimeout(() => {
       clearInterval(tickTimer.current);
       setMode(null);
       setIsConnected(false);
       Alert.alert(
         '⏱ Session Ended',
-        'The stream has been running for 60 minutes and has been stopped to save data and battery.\n\nTap OK to return to the menu and start a new session if needed.',
+        'The 60-minute session limit was reached. Start a new session when ready.',
         [{ text: 'OK' }],
       );
     }, SESSION_LIMIT_MS);
   }
 
-  function handleStart(selectedMode, codeOverride) {
+  async function handleStart(selectedMode, codeOverride) {
     const code = codeOverride ?? roomInput.trim();
     if (selectedMode === 'viewer' && !code) {
       Alert.alert('Enter a code', 'Please enter the monitor room code first.');
       return;
     }
-    // Always get a fresh token before starting so it never arrives expired
+
+    // Request camera + mic permissions before starting monitor mode
+    if (selectedMode === 'monitor') {
+      const cam = cameraPermission?.granted ? cameraPermission : await requestCameraPermission();
+      const mic = micPermission?.granted    ? micPermission    : await requestMicPermission();
+      if (!cam?.granted || !mic?.granted) {
+        Alert.alert(
+          'Permissions Required',
+          'Camera and microphone access are needed to stream.\n\nPlease allow them in your phone\'s Settings → Apps → BabyMonitorApp → Permissions.',
+          [{ text: 'OK' }],
+        );
+        return;
+      }
+    }
+
     const currentUser = auth.currentUser;
     if (!currentUser) {
       Alert.alert('Not signed in', 'Please sign in again.');
       return;
     }
-    currentUser.getIdToken(true).then(freshToken => {
+
+    currentUser.getIdToken(true).then(async freshToken => {
+      const ice = await fetchIceServers(freshToken);
       setToken(freshToken);
-      setRoomId(code);
+      setIceServers(ice);
+      setRoomId(selectedMode === 'monitor' ? currentUser.uid : code);
       setIsConnected(false);
       setViewerStatus('connecting');
       setWebViewKey(k => k + 1);
@@ -425,34 +173,35 @@ export default function VideoFeedScreen() {
 
   function handleMessage(e) {
     const msg = e.nativeEvent.data;
-    if (msg === 'connected' || msg === 'streaming') {
-      setIsConnected(true);
-      setViewerStatus('live');
+    // Log everything from the WebView so camera errors are visible in the terminal
+    if (msg.startsWith('camera-')) {
+      console.log('[WebView camera]', msg);
+      if (msg.startsWith('camera-error:')) {
+        const detail = msg.replace('camera-error:', '');
+        Alert.alert(
+          'Camera Error',
+          `Could not start camera:\n\n${detail}\n\nCheck that camera permission is allowed in Settings → Apps → BabyMonitorApp → Permissions.`,
+          [{ text: 'OK', onPress: handleStop }],
+        );
+      }
+      return;
     }
-    if (msg === 'waiting') {
-      setViewerStatus('waiting');
-    }
-    if (msg === 'disconnected') {
-      setIsConnected(false);
-      setViewerStatus('lost');
-    }
-    if (msg === 'viewer-left') {
-      setIsConnected(false);
-    }
+    if (msg === 'connected' || msg === 'streaming') { setIsConnected(true); setViewerStatus('live'); }
+    if (msg === 'waiting')      { setViewerStatus('waiting'); }
+    if (msg === 'disconnected') { setIsConnected(false); setViewerStatus('lost'); }
+    if (msg === 'viewer-left')  { setIsConnected(false); }
     if (msg === 'room-error') {
       Alert.alert('Room Not Found', 'No monitor found with that code. Check the code and try again.');
       handleStop();
     }
   }
 
-  // Reload the WebView to reconnect without leaving the session
   function handleRetry() {
     setIsConnected(false);
     setViewerStatus('connecting');
-    setWebViewKey(k => k + 1); // forces WebView to remount with fresh socket
+    setWebViewKey(k => k + 1);
   }
 
-  // Format elapsed seconds → "mm:ss" or "1h 02m" after an hour
   function formatElapsed(secs) {
     const h = Math.floor(secs / 3600);
     const m = Math.floor((secs % 3600) / 60);
@@ -461,10 +210,26 @@ export default function VideoFeedScreen() {
     return `${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
   }
 
-  // ── Step 1: pick role ────────────────────────────────────────────────────────
+  // Config injected into the WebView page before its scripts run.
+  // window.__RN_CFG__ is read by the monitor/viewer HTML served from the server.
+  // Pass config in the URL hash — fragments are never sent to the server
+  // (token stays private) but are immediately available via window.location.hash,
+  // bypassing injectedJavaScript timing issues on Android WebView.
+  const configHash = token
+    ? '#' + encodeURIComponent(JSON.stringify({
+        token,
+        roomId,
+        signalingUrl: SIGNALING_HTTP,
+        iceServers,
+      }))
+    : '';
+
+  // ── Role picker ──────────────────────────────────────────────────────────────
   if (!mode && step === 'pick') {
     return (
-      <View style={styles.selector}>
+      <View style={[styles.selector, { paddingTop: insets.top + 16, paddingBottom: insets.bottom + 16 }]}>
+        <StatusBar barStyle="dark-content" backgroundColor="#F8F9FE" />
+
         <Ionicons name="videocam" size={52} color="#6C63FF" style={{ marginBottom: 14 }} />
         <Text style={styles.title}>Baby Monitor</Text>
         <Text style={styles.subtitle}>Choose your role for this session</Text>
@@ -490,13 +255,13 @@ export default function VideoFeedScreen() {
               Place this phone in the baby's room. It streams video and audio to the viewer.
             </Text>
           </View>
+          <Ionicons name="chevron-forward" size={18} color="#C0C0D0" />
         </TouchableOpacity>
 
         <TouchableOpacity
           style={[styles.modeCard, { borderColor: '#4CAF50' }]}
           onPress={() => {
             if (Platform.OS === 'ios') {
-              // Alert.prompt is a native iOS dialog — keyboard can never cover it
               Alert.prompt(
                 'Enter Room Code',
                 'Paste or type the code shown on the monitor phone',
@@ -522,6 +287,7 @@ export default function VideoFeedScreen() {
               Watch the live feed. You'll need the room code from the monitor phone.
             </Text>
           </View>
+          <Ionicons name="chevron-forward" size={18} color="#C0C0D0" />
         </TouchableOpacity>
 
         <Text style={styles.hint}>Sessions automatically stop after 60 minutes to save data.</Text>
@@ -529,23 +295,25 @@ export default function VideoFeedScreen() {
     );
   }
 
-  // ── Step 2: enter room code — Android only (iOS uses Alert.prompt above) ─────
+  // ── Enter room code — Android only ───────────────────────────────────────────
   if (!mode && step === 'viewer-code') {
     return (
-      <View style={styles.codeScreen}>
+      <View style={[styles.codeScreen, { paddingTop: insets.top + 12, paddingBottom: insets.bottom + 16 }]}>
+        <StatusBar barStyle="dark-content" backgroundColor="#F8F9FE" />
+
         <TouchableOpacity style={styles.backBtn} onPress={() => setStep('pick')}>
           <Ionicons name="arrow-back" size={20} color="#6C63FF" />
           <Text style={styles.backText}>Back</Text>
         </TouchableOpacity>
+
         <View style={styles.codeHeader}>
           <View style={[styles.modeIcon, { backgroundColor: '#E8F5E9', width: 64, height: 64, borderRadius: 18 }]}>
             <Ionicons name="eye" size={32} color="#4CAF50" />
           </View>
           <Text style={styles.codeTitle}>Enter Room Code</Text>
-          <Text style={styles.codeSub}>
-            Paste or type the code shown on the monitor phone.
-          </Text>
+          <Text style={styles.codeSub}>Paste or type the code shown on the monitor phone.</Text>
         </View>
+
         <TextInput
           style={styles.codeInput}
           value={roomInput}
@@ -558,43 +326,82 @@ export default function VideoFeedScreen() {
           returnKeyType="go"
           onSubmitEditing={() => handleStart('viewer')}
         />
-        <TouchableOpacity style={styles.codeBtn} onPress={() => handleStart('viewer')} activeOpacity={0.85}>
+
+        <TouchableOpacity
+          style={styles.codeBtn}
+          onPress={() => handleStart('viewer')}
+          activeOpacity={0.85}
+        >
           <Text style={styles.codeBtnText}>Connect as Viewer</Text>
         </TouchableOpacity>
       </View>
     );
   }
 
-  // ── Active session ──────────────────────────────────────────────────────────
-  const html = mode === 'monitor'
-    ? buildMonitorHtml(token, roomId)
-    : buildViewerHtml(token, roomId);
-
+  // ── Active session ───────────────────────────────────────────────────────────
+  const webViewUri = (mode === 'monitor' ? MONITOR_URL : VIEWER_URL) + configHash;
   const showRetryOverlay = mode === 'viewer' && viewerStatus !== 'live';
+
+  // Android monitor uses native WebRTC (react-native-webrtc) to bypass WebView
+  // camera restrictions on Samsung and other Android devices.
+  const useNativeMonitor = USE_NATIVE_MONITOR && mode === 'monitor';
 
   return (
     <View style={styles.container}>
-      {/* WebView always full-size — Modal floats above it at OS level */}
-      <WebView
-        key={webViewKey}
-        ref={webViewRef}
-        source={{ html }}
-        style={styles.webView}
-        mediaPlaybackRequiresUserAction={false}
-        allowsInlineMediaPlayback
-        javaScriptEnabled
-        originWhitelist={['*']}
-        onMessage={handleMessage}
-      />
+      <StatusBar barStyle="light-content" backgroundColor="#000" />
 
-      {/* Modal renders at OS level — guaranteed above WebView native layer */}
+      {useNativeMonitor ? (
+        <NativeMonitorView
+          token={token}
+          roomId={roomId}
+          signalingUrl={SIGNALING_HTTP}
+          iceServers={iceServers}
+          onStatus={(s) => console.log('[NativeMonitor]', s)}
+          onStreaming={() => setIsConnected(true)}
+          onViewerLeft={() => setIsConnected(false)}
+        />
+      ) : (
+        <WebView
+          key={webViewKey}
+          ref={webViewRef}
+          source={{ uri: webViewUri }}
+          style={styles.webView}
+          mediaPlaybackRequiresUserAction={false}
+          allowsInlineMediaPlayback
+          javaScriptEnabled
+          domStorageEnabled
+          allowUniversalAccessFromFileURLs
+          allowFileAccessFromFileURLs
+          mixedContentMode="always"
+          originWhitelist={['*']}
+          onPermissionRequest={(request) => {
+            const CAMERA_RESOURCES = [
+              'android.webkit.resource.VIDEO_CAPTURE',
+              'android.webkit.resource.AUDIO_CAPTURE',
+            ];
+            const toGrant = (request.resources && request.resources.length > 0)
+              ? request.resources : CAMERA_RESOURCES;
+            request.grant(toGrant);
+          }}
+          onMessage={handleMessage}
+          renderLoading={() => (
+            <View style={styles.webViewLoading}>
+              <ActivityIndicator size="large" color="#6C63FF" />
+              <Text style={styles.webViewLoadingText}>Loading…</Text>
+            </View>
+          )}
+          startInLoadingState
+        />
+      )}
+
+      {/* Retry overlay — Modal renders at OS level, above WebView native layer */}
       <Modal
         visible={showRetryOverlay}
         transparent={false}
         animationType="fade"
         onRequestClose={handleStop}
       >
-        <View style={styles.retryOverlay}>
+        <View style={[styles.retryOverlay, { paddingTop: insets.top, paddingBottom: insets.bottom }]}>
           <Ionicons
             name={viewerStatus === 'lost' ? 'wifi-outline' : 'time-outline'}
             size={56}
@@ -609,9 +416,9 @@ export default function VideoFeedScreen() {
               ? 'The camera feed dropped. Tap Retry to reconnect.'
               : 'Start Baby Monitor on the camera phone, then tap Retry.'}
           </Text>
-          {viewerStatus === 'connecting' || viewerStatus === 'waiting'
-            ? <ActivityIndicator size="large" color="#6C63FF" style={{ marginBottom: 24 }} />
-            : null}
+          {(viewerStatus === 'connecting' || viewerStatus === 'waiting') && (
+            <ActivityIndicator size="large" color="#6C63FF" style={{ marginBottom: 24 }} />
+          )}
           <TouchableOpacity style={styles.retryBtn} onPress={handleRetry} activeOpacity={0.85}>
             <Ionicons name="refresh" size={18} color="#fff" />
             <Text style={styles.retryBtnText}>Retry</Text>
@@ -622,8 +429,8 @@ export default function VideoFeedScreen() {
         </View>
       </Modal>
 
-      {/* Status bar */}
-      <View style={styles.statusBar}>
+      {/* Status bar at the bottom */}
+      <View style={[styles.statusBar, { paddingBottom: Math.max(insets.bottom, 8) }]}>
         <View style={[styles.dot, { backgroundColor: isConnected ? '#4CAF50' : '#FF9800' }]} />
         <View style={{ flex: 1 }}>
           <Text style={styles.statusText} numberOfLines={1}>
@@ -632,8 +439,7 @@ export default function VideoFeedScreen() {
               : (isConnected ? 'Live feed connected' : viewerStatus === 'lost' ? 'Connection lost' : 'Waiting for monitor…')}
           </Text>
           <Text style={[styles.timerText, elapsed >= 3300 && { color: '#FF9800' }]}>
-            {formatElapsed(elapsed)} / 60:00
-            {elapsed >= 3300 ? '  ⚠️ stopping soon' : ''}
+            {formatElapsed(elapsed)} / 60:00{elapsed >= 3300 ? '  ⚠️ stopping soon' : ''}
           </Text>
         </View>
         <TouchableOpacity style={styles.stopBtn} onPress={handleStop}>
@@ -647,80 +453,90 @@ export default function VideoFeedScreen() {
 
 // ── Styles ────────────────────────────────────────────────────────────────────
 
+const { width: SCREEN_W } = Dimensions.get('window');
+
 const styles = StyleSheet.create({
-  // Active session
+  // ── Active session
   container: { flex: 1, backgroundColor: '#000' },
-  webView:   { flex: 1 },
-  statusBar: {
-    flexDirection: 'row', alignItems: 'center', gap: 8,
-    backgroundColor: '#1A1A2E', padding: 10, paddingHorizontal: 16,
+  webView:   { flex: 1, backgroundColor: '#000' },
+
+  webViewLoading: {
+    position: 'absolute', inset: 0,
+    backgroundColor: '#000',
+    alignItems: 'center', justifyContent: 'center', gap: 12,
   },
-  // Retry overlay — full-screen Modal content
+  webViewLoadingText: { color: '#888', fontSize: 13 },
+
+  statusBar: {
+    flexDirection: 'row', alignItems: 'center', gap: 10,
+    backgroundColor: '#1A1A2E',
+    paddingTop: 10, paddingHorizontal: 16,
+  },
+  dot:        { width: 8, height: 8, borderRadius: 4, flexShrink: 0 },
+  statusText: { color: '#fff', fontSize: 13 },
+  timerText:  { color: '#8E8EA0', fontSize: 11, marginTop: 1 },
+  stopBtn:    { flexDirection: 'row', alignItems: 'center', gap: 4, flexShrink: 0 },
+  stopText:   { color: '#FF6B6B', fontSize: 13, fontWeight: '600' },
+
+  // ── Retry overlay
   retryOverlay: {
-    flex: 1,
-    backgroundColor: '#0D0D1A',
-    alignItems: 'center',
-    justifyContent: 'center',
-    padding: 36,
+    flex: 1, backgroundColor: '#0D0D1A',
+    alignItems: 'center', justifyContent: 'center', padding: 36,
   },
   retryTitle: {
     color: '#fff', fontSize: 20, fontWeight: '700', marginBottom: 10, textAlign: 'center',
   },
   retrySubtitle: {
-    color: '#aaa', fontSize: 13, textAlign: 'center', lineHeight: 19, marginBottom: 28,
+    color: '#aaa', fontSize: 14, textAlign: 'center', lineHeight: 20, marginBottom: 28,
   },
   retryBtn: {
     flexDirection: 'row', alignItems: 'center', gap: 8,
     backgroundColor: '#6C63FF', borderRadius: 14,
-    paddingVertical: 13, paddingHorizontal: 32, marginBottom: 14,
+    paddingVertical: 14, paddingHorizontal: 36, marginBottom: 14,
   },
-  retryBtnText: { color: '#fff', fontWeight: '700', fontSize: 15 },
-  retryStopBtn: { paddingVertical: 8 },
-  retryStopText: { color: '#FF6B6B', fontSize: 13, fontWeight: '600' },
+  retryBtnText:  { color: '#fff', fontWeight: '700', fontSize: 15 },
+  retryStopBtn:  { paddingVertical: 10 },
+  retryStopText: { color: '#FF6B6B', fontSize: 14, fontWeight: '600' },
 
-  dot:       { width: 8, height: 8, borderRadius: 4 },
-  statusText:{ color: '#fff', fontSize: 13 },
-  timerText: { color: '#8E8EA0', fontSize: 11, marginTop: 1 },
-  stopBtn:   { flexDirection: 'row', alignItems: 'center', gap: 4 },
-  stopText:  { color: '#FF6B6B', fontSize: 13, fontWeight: '600' },
-
-  // Step 1 — role picker
+  // ── Role picker
   selector: {
     flex: 1, backgroundColor: '#F8F9FE',
-    alignItems: 'center', justifyContent: 'center', padding: 24,
+    alignItems: 'center', justifyContent: 'center',
+    paddingHorizontal: Math.min(24, SCREEN_W * 0.06),
   },
   title:    { fontSize: 26, fontWeight: '800', color: '#1A1A2E', marginBottom: 6 },
-  subtitle: { fontSize: 14, color: '#8E8EA0', marginBottom: 22, textAlign: 'center' },
+  subtitle: { fontSize: 14, color: '#8E8EA0', marginBottom: 24, textAlign: 'center' },
   tokenRow: { flexDirection: 'row', alignItems: 'center', gap: 8, marginBottom: 12 },
   tokenText: { color: '#8E8EA0', fontSize: 13 },
+
   modeCard: {
     flexDirection: 'row', alignItems: 'center', gap: 14,
-    backgroundColor: '#fff', borderRadius: 16, padding: 18,
+    backgroundColor: '#fff', borderRadius: 18, padding: 18,
     width: '100%', marginBottom: 14, borderWidth: 2,
-    shadowColor: '#000', shadowOpacity: 0.05, shadowRadius: 8, elevation: 2,
+    shadowColor: '#000', shadowOpacity: 0.06, shadowRadius: 10,
+    shadowOffset: { width: 0, height: 2 }, elevation: 3,
   },
-  modeIcon:  { width: 52, height: 52, borderRadius: 14, alignItems: 'center', justifyContent: 'center' },
+  modeIcon:  { width: 52, height: 52, borderRadius: 14, alignItems: 'center', justifyContent: 'center', flexShrink: 0 },
   modeText:  { flex: 1 },
   modeTitle: { fontSize: 16, fontWeight: '700', color: '#1A1A2E', marginBottom: 4 },
   modeDesc:  { fontSize: 12, color: '#8E8EA0', lineHeight: 17 },
-  hint: { fontSize: 12, color: '#B0B0C4', marginTop: 8, textAlign: 'center' },
+  hint:      { fontSize: 12, color: '#B0B0C4', marginTop: 8, textAlign: 'center' },
 
-  // Step 2 — viewer code entry (input is near top, keyboard opens below)
+  // ── Viewer code entry (Android)
   codeScreen: {
-    flex: 1, backgroundColor: '#F8F9FE', paddingHorizontal: 24, paddingTop: 20,
+    flex: 1, backgroundColor: '#F8F9FE',
+    paddingHorizontal: Math.min(24, SCREEN_W * 0.06),
   },
-  backBtn: { flexDirection: 'row', alignItems: 'center', gap: 6, marginBottom: 32 },
-  backText: { color: '#6C63FF', fontSize: 15, fontWeight: '600' },
+  backBtn:   { flexDirection: 'row', alignItems: 'center', gap: 6, marginBottom: 28 },
+  backText:  { color: '#6C63FF', fontSize: 15, fontWeight: '600' },
   codeHeader: { alignItems: 'center', marginBottom: 32 },
   codeTitle: { fontSize: 22, fontWeight: '800', color: '#1A1A2E', marginTop: 16, marginBottom: 8 },
   codeSub:   { fontSize: 13, color: '#8E8EA0', textAlign: 'center', lineHeight: 19 },
   codeInput: {
     backgroundColor: '#fff',
     borderWidth: 1.5, borderColor: '#6C63FF',
-    borderRadius: 14, paddingHorizontal: 16,
-    paddingVertical: 14,
-    fontSize: 15, color: '#1A1A2E',
-    marginBottom: 16,
+    borderRadius: 14, paddingHorizontal: 16, paddingVertical: 14,
+    fontSize: 16, color: '#1A1A2E', marginBottom: 16,
     shadowColor: '#6C63FF', shadowOpacity: 0.1, shadowRadius: 6, elevation: 2,
   },
   codeBtn: {
