@@ -366,6 +366,7 @@ export default function VideoFeedScreen() {
           ref={webViewRef}
           source={{ uri: webViewUri }}
           style={styles.webView}
+          injectedJavaScriptBeforeContentLoaded={token ? `window.__RN_CFG__ = ${JSON.stringify({ token, roomId, signalingUrl: SIGNALING_HTTP, iceServers })};true;` : undefined}
           mediaPlaybackRequiresUserAction={false}
           allowsInlineMediaPlayback
           javaScriptEnabled
